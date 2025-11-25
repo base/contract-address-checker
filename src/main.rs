@@ -1,0 +1,391 @@
+use alloy::primitives::Address;
+use alloy::providers::ProviderBuilder;
+use alloy::sol;
+use alloy::sol_types::SolCall;
+use clap::Parser;
+use regex::Regex;
+use std::error::Error;
+use std::fs;
+use std::path::PathBuf;
+use std::str::FromStr;
+
+sol! {
+    #[sol(rpc)]
+    interface SystemConfig {
+        function batchInbox() external view returns (address);
+        function disputeGameFactory() external view returns (address);
+        function guardian() external view returns (address);
+        function l1CrossDomainMessenger() external view returns (address);
+        function l1ERC721Bridge() external view returns (address);
+        function l1StandardBridge() external view returns (address);
+        function optimismMintableERC20Factory() external view returns (address);
+        function optimismPortal() external view returns (address);
+        function owner() external view returns (address);
+        function proxyAdmin() external view returns (address);
+        function proxyAdminOwner() external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface Multicall3 {
+        struct Call3 {
+            address target;
+            bool allowFailure;
+            bytes callData;
+        }
+
+        struct Result {
+            bool success;
+            bytes returnData;
+        }
+
+        function aggregate3(Call3[] calldata calls) external view returns (Result[] memory returnData);
+    }
+}
+
+const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    /// Path to the file to parse
+    #[arg(short, long, value_name = "FILE")]
+    file: PathBuf,
+
+    /// Mainnet RPC URL
+    #[arg(long, value_name = "URL")]
+    mainnet_rpc_url: Option<String>,
+
+    /// Sepolia RPC URL
+    #[arg(long, value_name = "URL")]
+    sepolia_rpc_url: Option<String>,
+}
+
+struct Contract {
+    name: String,
+    address: String,
+}
+
+struct Network {
+    name: String,
+    contracts: Vec<Contract>,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let cli = Cli::parse();
+
+    let content = fs::read_to_string(&cli.file)?;
+
+    // Regex to capture network headers (lines starting with ###)
+    let network_re = Regex::new(r"^###\s+(?P<network>.+)")?;
+
+    // Regex to capture contract name and address
+    // Matches lines starting with | (optional), then name column, then address column containing [address]
+    let contract_re =
+        Regex::new(r"\|\s*(?P<name>[^|]+?)\s*\|\s*\[(?P<address>0x[a-fA-F0-9]{40})\]")?;
+
+    let mut networks: Vec<Network> = Vec::new();
+    let mut current_network_name: Option<String> = None;
+
+    for line in content.lines() {
+        // Check for network header
+        if let Some(caps) = network_re.captures(line) {
+            let network_name = caps
+                .name("network")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap();
+            current_network_name = Some(network_name);
+            continue;
+        }
+
+        // Check for contract
+        if let Some(caps) = contract_re.captures(line) {
+            let name = caps
+                .name("name")
+                .map(|m| m.as_str().trim().to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            let address = caps
+                .name("address")
+                .map(|m| m.as_str().to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+
+            let net_name = current_network_name
+                .clone()
+                .unwrap_or_else(|| "Unknown Network".to_string());
+
+            // Find existing network group or create new one
+            if let Some(pos) = networks.iter().position(|n| n.name == net_name) {
+                networks[pos].contracts.push(Contract { name, address });
+            } else {
+                networks.push(Network {
+                    name: net_name,
+                    contracts: vec![Contract { name, address }],
+                });
+            }
+        }
+    }
+
+    // Print grouped results
+    for network in &networks {
+        println!("\nNetwork: {}", network.name);
+        println!("{:<30} | Address", "Contract Name");
+        println!("-------------------------------|-------------------------------------------");
+        for contract in &network.contracts {
+            println!("{:<30} | {}", contract.name, contract.address);
+        }
+    }
+
+    // Verification Logic
+    println!("\n---------------------------------------------------------------------------");
+    println!("Verifying addresses...");
+    println!("---------------------------------------------------------------------------");
+
+    let mainnet_verification = verify_network(
+        &networks,
+        "Ethereum Mainnet",
+        "Base Mainnet",
+        cli.mainnet_rpc_url,
+    );
+
+    let sepolia_verification = verify_network(
+        &networks,
+        "Ethereum Testnet (Sepolia)",
+        "Base Testnet (Sepolia)",
+        cli.sepolia_rpc_url,
+    );
+
+    tokio::join!(mainnet_verification, sepolia_verification);
+
+    Ok(())
+}
+
+async fn verify_network(
+    networks: &[Network],
+    l1_network_name: &str,
+    l2_network_name: &str,
+    rpc_url: Option<String>,
+) {
+    if rpc_url.is_none() {
+        println!(
+            "Skipping verification for {} (No RPC URL provided)",
+            l1_network_name
+        );
+        return;
+    }
+
+    let rpc_url = rpc_url.unwrap();
+
+    let system_config_addr = find_contract_address(networks, l1_network_name, "SystemConfig");
+
+    if system_config_addr.is_none() {
+        println!(
+            "Could not find SystemConfig address for {}",
+            l1_network_name
+        );
+        return;
+    }
+
+    let sys_config = match Address::from_str(&system_config_addr.unwrap()) {
+        Ok(addr) => addr,
+        Err(e) => {
+            println!(
+                "Error parsing SystemConfig address for {}: {}",
+                l1_network_name, e
+            );
+            return;
+        }
+    };
+
+    let provider = ProviderBuilder::new().on_http(rpc_url.parse().unwrap());
+    let multicall = Multicall3::new(
+        Address::from_str(MULTICALL3_ADDRESS).unwrap(),
+        provider.clone(),
+    );
+
+    struct CheckConfig<'a> {
+        name: &'a str,
+        file_search_name: &'a str,
+        network: &'a str,
+        call_data: Vec<u8>,
+    }
+
+    let checks = vec![
+        CheckConfig {
+            name: "Batch Inbox",
+            file_search_name: "Batch Inbox",
+            network: l2_network_name,
+            call_data: SystemConfig::batchInboxCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "DisputeGameFactory",
+            file_search_name: "DisputeGameFactoryProxy",
+            network: l1_network_name,
+            call_data: SystemConfig::disputeGameFactoryCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "Guardian",
+            file_search_name: "Guardian",
+            network: l2_network_name,
+            call_data: SystemConfig::guardianCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "L1CrossDomainMessenger",
+            file_search_name: "L1CrossDomainMessenger",
+            network: l1_network_name,
+            call_data: SystemConfig::l1CrossDomainMessengerCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "L1ERC721Bridge",
+            file_search_name: "L1ERC721Bridge",
+            network: l1_network_name,
+            call_data: SystemConfig::l1ERC721BridgeCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "L1StandardBridge",
+            file_search_name: "L1StandardBridge",
+            network: l1_network_name,
+            call_data: SystemConfig::l1StandardBridgeCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "OptimismMintableERC20Factory",
+            file_search_name: "OptimismMintableERC20Factory",
+            network: l1_network_name,
+            call_data: SystemConfig::optimismMintableERC20FactoryCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "OptimismPortal",
+            file_search_name: "OptimismPortal",
+            network: l1_network_name,
+            call_data: SystemConfig::optimismPortalCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "ProxyAdmin",
+            file_search_name: "ProxyAdmin",
+            network: l1_network_name,
+            call_data: SystemConfig::proxyAdminCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "Proxy Admin Owner",
+            file_search_name: "Proxy Admin Owner (L1)",
+            network: l2_network_name,
+            call_data: SystemConfig::proxyAdminOwnerCall {}.abi_encode(),
+        },
+        CheckConfig {
+            name: "SystemConfig Owner",
+            file_search_name: "System config owner",
+            network: l2_network_name,
+            call_data: SystemConfig::ownerCall {}.abi_encode(),
+        },
+    ];
+
+    let mut calls = Vec::with_capacity(checks.len());
+    let mut expected_addresses = Vec::with_capacity(checks.len());
+
+    for check in &checks {
+        let expected = find_contract_address(networks, check.network, check.file_search_name);
+        expected_addresses.push(expected);
+
+        calls.push(Multicall3::Call3 {
+            target: sys_config,
+            allowFailure: true,
+            callData: check.call_data.clone().into(),
+        });
+    }
+
+    let result = match multicall.aggregate3(calls).call().await {
+        Ok(result) => result,
+        Err(e) => {
+            println!("Error executing multicall on {}: {}", l1_network_name, e);
+            return;
+        }
+    };
+
+    let mut all_checks_passed = true;
+    for (i, check) in checks.iter().enumerate() {
+        let passed = process_result(
+            l1_network_name,
+            check.network,
+            check.name,
+            expected_addresses[i].clone(),
+            &result.returnData[i],
+        );
+        if !passed {
+            all_checks_passed = false;
+        }
+    }
+
+    if all_checks_passed {
+        println!("✅ All addresses match for {}", l1_network_name);
+    }
+}
+
+fn find_contract_address(
+    networks: &[Network],
+    network_name: &str,
+    contract_name: &str,
+) -> Option<String> {
+    networks
+        .iter()
+        .find(|n| n.name == network_name)
+        .and_then(|n| {
+            n.contracts
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(contract_name))
+                .map(|c| c.address.clone())
+        })
+}
+
+fn process_result(
+    l1_network: &str,
+    expected_addr_network: &str,
+    contract_name: &str,
+    expected_addr: Option<String>,
+    res: &Multicall3::Result,
+) -> bool {
+    if expected_addr.is_none() {
+        println!(
+            "Could not find {} address for {}",
+            contract_name, expected_addr_network
+        );
+        return false;
+    }
+
+    let expected = match Address::from_str(&expected_addr.unwrap()) {
+        Ok(expected) => expected,
+        Err(e) => {
+            println!(
+                "Error parsing {} address for {}: {}",
+                contract_name, expected_addr_network, e
+            );
+            return false;
+        }
+    };
+
+    if !res.success {
+        println!("{} view call failed on {}", contract_name, l1_network);
+        return false;
+    }
+
+    // Decode address from return data
+    let decoded = match SystemConfig::batchInboxCall::abi_decode_returns(&res.returnData, true) {
+        Ok(decoded) => decoded,
+        Err(e) => {
+            println!(
+                "Error decoding {} return data on {}: {}",
+                contract_name, l1_network, e
+            );
+            return false;
+        }
+    };
+
+    let on_chain_addr = decoded._0;
+    if on_chain_addr != expected {
+        println!(
+            "❌ MISMATCH for {}: \n\tFile {}: {}\n\tChain {}: {}",
+            l1_network, contract_name, expected, contract_name, on_chain_addr
+        );
+        return false;
+    }
+
+    true
+}
