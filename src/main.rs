@@ -259,6 +259,13 @@ async fn verify_network(
             target: dispute_game_factory,
         },
         CheckConfig {
+            name: "Permissioned Dispute Game",
+            file_search_name: "PermissionedDisputeGame",
+            network: l1_network_name,
+            call_data: DisputeGameFactory::gameImplsCall { gameType: 1 }.abi_encode(),
+            target: dispute_game_factory,
+        },
+        CheckConfig {
             name: "Guardian",
             file_search_name: "Guardian",
             network: l2_network_name,
