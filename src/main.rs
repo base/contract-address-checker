@@ -26,6 +26,11 @@ sol! {
     }
 
     #[sol(rpc)]
+    interface DisputeGameFactory {
+        function gameImpls(uint32 gameType) external view returns (address);
+    }
+
+    #[sol(rpc)]
     interface Multicall3 {
         struct Call3 {
             address target;
@@ -176,10 +181,20 @@ async fn verify_network(
     let rpc_url = rpc_url.unwrap();
 
     let system_config_addr = find_contract_address(networks, l1_network_name, "SystemConfig");
+    let dispute_game_factory_addr =
+        find_contract_address(networks, l1_network_name, "DisputeGameFactoryProxy");
 
     if system_config_addr.is_none() {
         println!(
             "Could not find SystemConfig address for {}",
+            l1_network_name
+        );
+        return;
+    }
+
+    if dispute_game_factory_addr.is_none() {
+        println!(
+            "Could not find DisputeGameFactory address for {}",
             l1_network_name
         );
         return;
@@ -190,6 +205,17 @@ async fn verify_network(
         Err(e) => {
             println!(
                 "Error parsing SystemConfig address for {}: {}",
+                l1_network_name, e
+            );
+            return;
+        }
+    };
+
+    let dispute_game_factory = match Address::from_str(&dispute_game_factory_addr.unwrap()) {
+        Ok(addr) => addr,
+        Err(e) => {
+            println!(
+                "Error parsing DisputeGameFactory address for {}: {}",
                 l1_network_name, e
             );
             return;
@@ -207,6 +233,7 @@ async fn verify_network(
         file_search_name: &'a str,
         network: &'a str,
         call_data: Vec<u8>,
+        target: Address,
     }
 
     let checks = vec![
@@ -215,66 +242,84 @@ async fn verify_network(
             file_search_name: "Batch Inbox",
             network: l2_network_name,
             call_data: SystemConfig::batchInboxCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "DisputeGameFactory",
             file_search_name: "DisputeGameFactoryProxy",
             network: l1_network_name,
             call_data: SystemConfig::disputeGameFactoryCall {}.abi_encode(),
+            target: sys_config,
+        },
+        CheckConfig {
+            name: "Fault Dispute Game",
+            file_search_name: "FaultDisputeGame",
+            network: l1_network_name,
+            call_data: DisputeGameFactory::gameImplsCall { gameType: 0 }.abi_encode(),
+            target: dispute_game_factory,
         },
         CheckConfig {
             name: "Guardian",
             file_search_name: "Guardian",
             network: l2_network_name,
             call_data: SystemConfig::guardianCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "L1CrossDomainMessenger",
             file_search_name: "L1CrossDomainMessenger",
             network: l1_network_name,
             call_data: SystemConfig::l1CrossDomainMessengerCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "L1ERC721Bridge",
             file_search_name: "L1ERC721Bridge",
             network: l1_network_name,
             call_data: SystemConfig::l1ERC721BridgeCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "L1StandardBridge",
             file_search_name: "L1StandardBridge",
             network: l1_network_name,
             call_data: SystemConfig::l1StandardBridgeCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "OptimismMintableERC20Factory",
             file_search_name: "OptimismMintableERC20Factory",
             network: l1_network_name,
             call_data: SystemConfig::optimismMintableERC20FactoryCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "OptimismPortal",
             file_search_name: "OptimismPortal",
             network: l1_network_name,
             call_data: SystemConfig::optimismPortalCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "ProxyAdmin",
             file_search_name: "ProxyAdmin",
             network: l1_network_name,
             call_data: SystemConfig::proxyAdminCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "Proxy Admin Owner",
             file_search_name: "Proxy Admin Owner (L1)",
             network: l2_network_name,
             call_data: SystemConfig::proxyAdminOwnerCall {}.abi_encode(),
+            target: sys_config,
         },
         CheckConfig {
             name: "SystemConfig Owner",
             file_search_name: "System config owner",
             network: l2_network_name,
             call_data: SystemConfig::ownerCall {}.abi_encode(),
+            target: sys_config,
         },
     ];
 
@@ -286,7 +331,7 @@ async fn verify_network(
         expected_addresses.push(expected);
 
         calls.push(Multicall3::Call3 {
-            target: sys_config,
+            target: check.target,
             allowFailure: true,
             callData: check.call_data.clone().into(),
         });
