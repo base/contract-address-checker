@@ -1,9 +1,9 @@
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolValue};
+use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use regex::Regex;
-use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -31,22 +31,62 @@ struct Cli {
     sepolia_rpc_url: Option<String>,
 }
 
+#[derive(Debug)]
 struct Contract {
     name: String,
     address: String,
 }
 
+#[derive(Debug)]
 struct Network {
     name: String,
     contracts: Vec<Contract>,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let content = fs::read_to_string(&cli.file)?;
+    let content = fs::read_to_string(&cli.file)
+        .with_context(|| format!("Failed to read input file: {:?}", cli.file))?;
 
+    let networks = parse_networks(&content)?;
+
+    // Verification Logic
+    println!("\n---------------------------------------------------------------------------");
+    println!("Verifying addresses...");
+    println!("---------------------------------------------------------------------------");
+
+    let mainnet_task = verify_network(
+        &networks,
+        "Ethereum Mainnet",
+        "Base Mainnet",
+        cli.mainnet_rpc_url,
+    );
+
+    let sepolia_task = verify_network(
+        &networks,
+        "Ethereum Testnet (Sepolia)",
+        "Base Testnet (Sepolia)",
+        cli.sepolia_rpc_url,
+    );
+
+    let (mainnet_res, sepolia_res) = tokio::join!(mainnet_task, sepolia_task);
+
+    // Check for RPC/System errors
+    let mainnet_success = mainnet_res.context("Mainnet verification failed during execution")?;
+    let sepolia_success = sepolia_res.context("Sepolia verification failed during execution")?;
+
+    if !mainnet_success || !sepolia_success {
+        eprintln!("\n❌ Verification failed for one or more networks.");
+        std::process::exit(1);
+    }
+
+    println!("\n✅ All checks passed successfully.");
+    Ok(())
+}
+
+fn parse_networks(content: &str) -> Result<Vec<Network>> {
     // Regex to capture network headers (lines starting with ###)
     let network_re = Regex::new(r"^###\s+(?P<network>.+)")?;
 
@@ -58,13 +98,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut networks: Vec<Network> = Vec::new();
     let mut current_network_name: Option<String> = None;
 
-    for line in content.lines() {
+    for (line_num, line) in content.lines().enumerate() {
         // Check for network header
         if let Some(caps) = network_re.captures(line) {
             let network_name = caps
                 .name("network")
                 .map(|m| m.as_str().trim().to_string())
-                .unwrap();
+                .ok_or_else(|| anyhow!("Failed to capture network name on line {}", line_num))?;
             current_network_name = Some(network_name);
             continue;
         }
@@ -80,9 +120,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .map(|m| m.as_str().to_string())
                 .unwrap_or_else(|| "Unknown".to_string());
 
-            let net_name = current_network_name
-                .clone()
-                .unwrap_or_else(|| "Unknown Network".to_string());
+            let net_name = current_network_name.clone().ok_or_else(|| {
+                anyhow!(
+                    "Found contract definition before network header on line {}",
+                    line_num
+                )
+            })?;
 
             // Find existing network group or create new one
             if let Some(pos) = networks.iter().position(|n| n.name == net_name) {
@@ -95,29 +138,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-
-    // Verification Logic
-    println!("\n---------------------------------------------------------------------------");
-    println!("Verifying addresses...");
-    println!("---------------------------------------------------------------------------");
-
-    let mainnet_verification = verify_network(
-        &networks,
-        "Ethereum Mainnet",
-        "Base Mainnet",
-        cli.mainnet_rpc_url,
-    );
-
-    let sepolia_verification = verify_network(
-        &networks,
-        "Ethereum Testnet (Sepolia)",
-        "Base Testnet (Sepolia)",
-        cli.sepolia_rpc_url,
-    );
-
-    tokio::join!(mainnet_verification, sepolia_verification);
-
-    Ok(())
+    Ok(networks)
 }
 
 async fn verify_network(
@@ -125,24 +146,28 @@ async fn verify_network(
     l1_network_name: &str,
     l2_network_name: &str,
     rpc_url: Option<String>,
-) {
-    if rpc_url.is_none() {
-        println!(
-            "Skipping verification for {} (No RPC URL provided)",
-            l1_network_name
-        );
-        return;
-    }
+) -> Result<bool> {
+    let rpc_url = match rpc_url {
+        Some(url) => url,
+        None => {
+            println!(
+                "Skipping verification for {} (No RPC URL provided)",
+                l1_network_name
+            );
+            return Ok(true);
+        }
+    };
 
-    let sys_config = get_addr(networks, l1_network_name, "SystemConfig");
-    let dispute_game_factory = get_addr(networks, l1_network_name, "DisputeGameFactoryProxy");
-    let fault_dispute_game = get_addr(networks, l1_network_name, "FaultDisputeGame");
-    let permissioned_dispute_game = get_addr(networks, l1_network_name, "PermissionedDisputeGame");
-    let mips = get_addr(networks, l1_network_name, "MIPS");
+    // Fail fast if we can't find the configuration addresses needed for lookup
+    let sys_config = get_addr(networks, l1_network_name, "SystemConfig")?;
+    let dispute_game_factory = get_addr(networks, l1_network_name, "DisputeGameFactoryProxy")?;
+    let fault_dispute_game = get_addr(networks, l1_network_name, "FaultDisputeGame")?;
+    let permissioned_dispute_game = get_addr(networks, l1_network_name, "PermissionedDisputeGame")?;
+    let mips = get_addr(networks, l1_network_name, "MIPS")?;
 
     let multicall = Multicall3::new(
-        Address::from_str(MULTICALL3_ADDRESS).unwrap(),
-        ProviderBuilder::new().on_http(rpc_url.unwrap().parse().unwrap()),
+        Address::from_str(MULTICALL3_ADDRESS).context("Invalid Multicall3 constant")?,
+        ProviderBuilder::new().on_http(rpc_url.parse().context("Invalid RPC URL")?),
     );
 
     struct CheckConfig<'a> {
@@ -310,13 +335,11 @@ async fn verify_network(
         });
     }
 
-    let result = match multicall.aggregate3(calls).call().await {
-        Ok(result) => result,
-        Err(e) => {
-            println!("Error executing multicall on {}: {}", l1_network_name, e);
-            return;
-        }
-    };
+    let result = multicall
+        .aggregate3(calls)
+        .call()
+        .await
+        .context(format!("Multicall execution failed on {}", l1_network_name))?;
 
     let mut all_checks_passed = true;
     for (i, check) in checks.iter().enumerate() {
@@ -335,27 +358,26 @@ async fn verify_network(
     if all_checks_passed {
         println!("✅ All addresses match for {}", l1_network_name);
     }
+
+    Ok(all_checks_passed)
 }
 
-fn get_addr(networks: &[Network], network_name: &str, contract_name: &str) -> Address {
-    let addr = find_contract_address(networks, network_name, contract_name);
+fn get_addr(networks: &[Network], network_name: &str, contract_name: &str) -> Result<Address> {
+    let addr_str =
+        find_contract_address(networks, network_name, contract_name).ok_or_else(|| {
+            anyhow!(
+                "Could not find {} address for {}",
+                contract_name,
+                network_name
+            )
+        })?;
 
-    if addr.is_none() {
-        panic!(
-            "Could not find {} address for {}",
+    Address::from_str(&addr_str).with_context(|| {
+        format!(
+            "Error parsing {} address for {}",
             contract_name, network_name
-        );
-    }
-
-    match Address::from_str(&addr.unwrap()) {
-        Ok(addr) => addr,
-        Err(e) => {
-            panic!(
-                "Error parsing SystemConfig address for {}: {}",
-                network_name, e
-            );
-        }
-    }
+        )
+    })
 }
 
 fn find_contract_address(
@@ -381,20 +403,23 @@ fn process_result(
     expected_addr: Option<String>,
     res: &Multicall3::Result,
 ) -> bool {
-    if expected_addr.is_none() {
-        println!(
-            "Could not find {} address for {}",
-            contract_name, expected_addr_network
-        );
-        return false;
-    }
+    let expected_str = match expected_addr {
+        Some(s) => s,
+        None => {
+            println!(
+                "Could not find expected address for {} in {}",
+                contract_name, expected_addr_network
+            );
+            return false;
+        }
+    };
 
-    let expected = match Address::from_str(&expected_addr.unwrap()) {
-        Ok(expected) => expected,
+    let expected = match Address::from_str(&expected_str) {
+        Ok(a) => a,
         Err(e) => {
             println!(
-                "Error parsing {} address for {}: {}",
-                contract_name, expected_addr_network, e
+                "Error parsing expected address for {} ({}): {}",
+                contract_name, expected_str, e
             );
             return false;
         }
@@ -405,9 +430,10 @@ fn process_result(
         return false;
     }
 
-    // Decode address from return data
-    let decoded = match SystemConfig::batchInboxCall::abi_decode_returns(&res.returnData, true) {
-        Ok(decoded) => decoded,
+    // Decode address from return data generically
+    // Most of these calls return a single Address
+    let on_chain_addr = match <Address>::abi_decode(&res.returnData, true) {
+        Ok(addr) => addr,
         Err(e) => {
             println!(
                 "Error decoding {} return data on {}: {}",
@@ -417,7 +443,6 @@ fn process_result(
         }
     };
 
-    let on_chain_addr = decoded._0;
     if on_chain_addr != expected {
         println!(
             "❌ MISMATCH for {}: \n\tFile {}: {}\n\tChain {}: {}",
