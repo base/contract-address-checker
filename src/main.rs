@@ -33,6 +33,7 @@ sol! {
     #[sol(rpc)]
     interface FaultDisputeGame {
         function anchorStateRegistry() external view returns (address);
+        function vm() external view returns (address);
     }
 
     #[sol(rpc)]
@@ -349,6 +350,13 @@ async fn verify_network(
             file_search_name: "AnchorStateRegistryProxy",
             network: l1_network_name,
             call_data: FaultDisputeGame::anchorStateRegistryCall {}.abi_encode(),
+            target: fault_dispute_game,
+        },
+        CheckConfig {
+            name: "MIPS",
+            file_search_name: "MIPS",
+            network: l1_network_name,
+            call_data: FaultDisputeGame::vmCall {}.abi_encode(),
             target: fault_dispute_game,
         },
     ];
