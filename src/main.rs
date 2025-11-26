@@ -31,6 +31,11 @@ sol! {
     }
 
     #[sol(rpc)]
+    interface FaultDisputeGame {
+        function anchorStateRegistry() external view returns (address);
+    }
+
+    #[sol(rpc)]
     interface Multicall3 {
         struct Call3 {
             address target;
@@ -130,16 +135,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Print grouped results
-    for network in &networks {
-        println!("\nNetwork: {}", network.name);
-        println!("{:<30} | Address", "Contract Name");
-        println!("-------------------------------|-------------------------------------------");
-        for contract in &network.contracts {
-            println!("{:<30} | {}", contract.name, contract.address);
-        }
-    }
-
     // Verification Logic
     println!("\n---------------------------------------------------------------------------");
     println!("Verifying addresses...");
@@ -183,6 +178,8 @@ async fn verify_network(
     let system_config_addr = find_contract_address(networks, l1_network_name, "SystemConfig");
     let dispute_game_factory_addr =
         find_contract_address(networks, l1_network_name, "DisputeGameFactoryProxy");
+    let fault_dispute_game_addr =
+        find_contract_address(networks, l1_network_name, "FaultDisputeGame");
 
     if system_config_addr.is_none() {
         println!(
@@ -195,6 +192,14 @@ async fn verify_network(
     if dispute_game_factory_addr.is_none() {
         println!(
             "Could not find DisputeGameFactory address for {}",
+            l1_network_name
+        );
+        return;
+    }
+
+    if fault_dispute_game_addr.is_none() {
+        println!(
+            "Could not find FaultDisputeGame address for {}",
             l1_network_name
         );
         return;
@@ -216,6 +221,17 @@ async fn verify_network(
         Err(e) => {
             println!(
                 "Error parsing DisputeGameFactory address for {}: {}",
+                l1_network_name, e
+            );
+            return;
+        }
+    };
+
+    let fault_dispute_game = match Address::from_str(&fault_dispute_game_addr.unwrap()) {
+        Ok(addr) => addr,
+        Err(e) => {
+            println!(
+                "Error parsing FaultDisputeGame address for {}: {}",
                 l1_network_name, e
             );
             return;
@@ -327,6 +343,13 @@ async fn verify_network(
             network: l2_network_name,
             call_data: SystemConfig::ownerCall {}.abi_encode(),
             target: sys_config,
+        },
+        CheckConfig {
+            name: "AnchorStateRegistry",
+            file_search_name: "AnchorStateRegistryProxy",
+            network: l1_network_name,
+            call_data: FaultDisputeGame::anchorStateRegistryCall {}.abi_encode(),
+            target: fault_dispute_game,
         },
     ];
 
