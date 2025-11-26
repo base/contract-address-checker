@@ -34,6 +34,19 @@ sol! {
     interface FaultDisputeGame {
         function anchorStateRegistry() external view returns (address);
         function vm() external view returns (address);
+        function weth() external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface PermissionedDisputeGame {
+        function challenger() external view returns (address);
+        function proposer() external view returns (address);
+        function weth() external view returns (address);
+    }
+
+    #[sol(rpc)]
+    interface MIPS {
+        function oracle() external view returns (address);
     }
 
     #[sol(rpc)]
@@ -181,6 +194,9 @@ async fn verify_network(
         find_contract_address(networks, l1_network_name, "DisputeGameFactoryProxy");
     let fault_dispute_game_addr =
         find_contract_address(networks, l1_network_name, "FaultDisputeGame");
+    let permissioned_dispute_game_addr =
+        find_contract_address(networks, l1_network_name, "PermissionedDisputeGame");
+    let mips_addr = find_contract_address(networks, l1_network_name, "MIPS");
 
     if system_config_addr.is_none() {
         println!(
@@ -203,6 +219,19 @@ async fn verify_network(
             "Could not find FaultDisputeGame address for {}",
             l1_network_name
         );
+        return;
+    }
+
+    if permissioned_dispute_game_addr.is_none() {
+        println!(
+            "Could not find PermissionedDisputeGame address for {}",
+            l1_network_name
+        );
+        return;
+    }
+
+    if mips_addr.is_none() {
+        println!("Could not find MIPS address for {}", l1_network_name);
         return;
     }
 
@@ -235,6 +264,26 @@ async fn verify_network(
                 "Error parsing FaultDisputeGame address for {}: {}",
                 l1_network_name, e
             );
+            return;
+        }
+    };
+
+    let permissioned_dispute_game =
+        match Address::from_str(&permissioned_dispute_game_addr.unwrap()) {
+            Ok(addr) => addr,
+            Err(e) => {
+                println!(
+                    "Error parsing PermissionedDisputeGame address for {}: {}",
+                    l1_network_name, e
+                );
+                return;
+            }
+        };
+
+    let mips = match Address::from_str(&mips_addr.unwrap()) {
+        Ok(addr) => addr,
+        Err(e) => {
+            println!("Error parsing MIPS address for {}: {}", l1_network_name, e);
             return;
         }
     };
@@ -281,6 +330,20 @@ async fn verify_network(
             network: l1_network_name,
             call_data: DisputeGameFactory::gameImplsCall { gameType: 1 }.abi_encode(),
             target: dispute_game_factory,
+        },
+        CheckConfig {
+            name: "Challenger",
+            file_search_name: "Challenger",
+            network: l2_network_name,
+            call_data: PermissionedDisputeGame::challengerCall {}.abi_encode(),
+            target: permissioned_dispute_game,
+        },
+        CheckConfig {
+            name: "Proposer",
+            file_search_name: "Output Proposer",
+            network: l2_network_name,
+            call_data: PermissionedDisputeGame::proposerCall {}.abi_encode(),
+            target: permissioned_dispute_game,
         },
         CheckConfig {
             name: "Guardian",
@@ -358,6 +421,27 @@ async fn verify_network(
             network: l1_network_name,
             call_data: FaultDisputeGame::vmCall {}.abi_encode(),
             target: fault_dispute_game,
+        },
+        CheckConfig {
+            name: "PreimageOracle",
+            file_search_name: "PreimageOracle",
+            network: l1_network_name,
+            call_data: MIPS::oracleCall {}.abi_encode(),
+            target: mips,
+        },
+        CheckConfig {
+            name: "DelayedWETHProxy (FDG)",
+            file_search_name: "DelayedWETHProxy (FDG)",
+            network: l1_network_name,
+            call_data: FaultDisputeGame::wethCall {}.abi_encode(),
+            target: fault_dispute_game,
+        },
+        CheckConfig {
+            name: "DelayedWETHProxy (PDG)",
+            file_search_name: "DelayedWETHProxy (PDG)",
+            network: l1_network_name,
+            call_data: PermissionedDisputeGame::wethCall {}.abi_encode(),
+            target: permissioned_dispute_game,
         },
     ];
 
