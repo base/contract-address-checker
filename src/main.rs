@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
 use alloy::providers::ProviderBuilder;
-use alloy::sol_types::{SolCall, SolValue};
+use alloy::sol_types::SolCall;
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use regex::Regex;
@@ -13,7 +13,8 @@ use abi::{
     DisputeGameFactory, FaultDisputeGame, MIPS, Multicall3, PermissionedDisputeGame, SystemConfig,
 };
 
-const MULTICALL3_ADDRESS: &str = "0xcA11bde05977b3631167028862bE2a173976CA11";
+mod constants;
+use constants::*;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -23,11 +24,11 @@ struct Cli {
     file: PathBuf,
 
     /// Mainnet RPC URL
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", env = MAINNET_RPC_URL_ENV)]
     mainnet_rpc_url: Option<String>,
 
     /// Sepolia RPC URL
-    #[arg(long, value_name = "URL")]
+    #[arg(long, value_name = "URL", env = SEPOLIA_RPC_URL_ENV)]
     sepolia_rpc_url: Option<String>,
 }
 
@@ -42,6 +43,18 @@ struct Network {
     name: String,
     contracts: Vec<Contract>,
 }
+
+#[derive(Debug)]
+struct CheckResult {
+    name: String,
+    network: String,
+    expected: Option<Address>,
+    actual: Option<Address>,
+    success: bool,
+    error: Option<String>,
+}
+
+type Decoder = Box<dyn Fn(&[u8]) -> Result<Address> + Send + Sync>;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,31 +72,84 @@ async fn main() -> Result<()> {
 
     let mainnet_task = verify_network(
         &networks,
-        "Ethereum Mainnet",
-        "Base Mainnet",
+        ETHEREUM_MAINNET,
+        BASE_MAINNET,
         cli.mainnet_rpc_url,
     );
 
     let sepolia_task = verify_network(
         &networks,
-        "Ethereum Testnet (Sepolia)",
-        "Base Testnet (Sepolia)",
+        ETHEREUM_SEPOLIA,
+        BASE_SEPOLIA,
         cli.sepolia_rpc_url,
     );
 
     let (mainnet_res, sepolia_res) = tokio::join!(mainnet_task, sepolia_task);
 
-    // Check for RPC/System errors
-    let mainnet_success = mainnet_res.context("Mainnet verification failed during execution")?;
-    let sepolia_success = sepolia_res.context("Sepolia verification failed during execution")?;
+    let mut exit_code = 0;
 
-    if !mainnet_success || !sepolia_success {
-        eprintln!("\n❌ Verification failed for one or more networks.");
-        std::process::exit(1);
+    for (res, network_name) in [
+        (mainnet_res, ETHEREUM_MAINNET),
+        (sepolia_res, ETHEREUM_SEPOLIA),
+    ] {
+        match res {
+            Ok(results) => {
+                if results.is_empty() {
+                    println!(
+                        "Skipped verification for {} (No RPC URL or addresses found)",
+                        network_name
+                    );
+                    continue;
+                }
+
+                let mut network_passed = true;
+                for check in results {
+                    if !check.success {
+                        network_passed = false;
+                        exit_code = 1;
+                        print_failure(&check);
+                    }
+                }
+
+                if network_passed {
+                    println!("✅ All addresses match for {}", network_name);
+                }
+            }
+            Err(e) => {
+                eprintln!("❌ Error verifying {}: {:#}", network_name, e);
+                exit_code = 1;
+            }
+        }
     }
 
-    println!("\n✅ All checks passed successfully.");
-    Ok(())
+    if exit_code == 0 {
+        println!("\n✅ All checks passed successfully.");
+    } else {
+        eprintln!("\n❌ Verification failed for one or more networks.");
+    }
+
+    std::process::exit(exit_code);
+}
+
+fn print_failure(check: &CheckResult) {
+    if let Some(error) = &check.error {
+        println!("❌ ERROR for {}: {}", check.name, error);
+        return;
+    }
+
+    let expected = check
+        .expected
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+    let actual = check
+        .actual
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
+
+    println!(
+        "❌ MISMATCH for {} ({}): \n\tFile: {}\n\tChain: {}",
+        check.name, check.network, expected, actual
+    );
 }
 
 fn parse_networks(content: &str) -> Result<Vec<Network>> {
@@ -104,7 +170,9 @@ fn parse_networks(content: &str) -> Result<Vec<Network>> {
             let network_name = caps
                 .name("network")
                 .map(|m| m.as_str().trim().to_string())
-                .ok_or_else(|| anyhow!("Failed to capture network name on line {}", line_num))?;
+                .ok_or_else(|| {
+                    anyhow!("Failed to capture network name on line {}", line_num + 1)
+                })?;
             current_network_name = Some(network_name);
             continue;
         }
@@ -114,16 +182,24 @@ fn parse_networks(content: &str) -> Result<Vec<Network>> {
             let name = caps
                 .name("name")
                 .map(|m| m.as_str().trim().to_string())
-                .unwrap_or_else(|| "Unknown".to_string());
+                .ok_or_else(|| {
+                    anyhow!("Failed to capture contract name on line {}", line_num + 1)
+                })?;
+
             let address = caps
                 .name("address")
                 .map(|m| m.as_str().to_string())
-                .unwrap_or_else(|| "Unknown".to_string());
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Failed to capture contract address on line {}",
+                        line_num + 1
+                    )
+                })?;
 
             let net_name = current_network_name.clone().ok_or_else(|| {
                 anyhow!(
                     "Found contract definition before network header on line {}",
-                    line_num
+                    line_num + 1
                 )
             })?;
 
@@ -146,16 +222,10 @@ async fn verify_network(
     l1_network_name: &str,
     l2_network_name: &str,
     rpc_url: Option<String>,
-) -> Result<bool> {
+) -> Result<Vec<CheckResult>> {
     let rpc_url = match rpc_url {
         Some(url) => url,
-        None => {
-            println!(
-                "Skipping verification for {} (No RPC URL provided)",
-                l1_network_name
-            );
-            return Ok(true);
-        }
+        None => return Ok(vec![]),
     };
 
     // Fail fast if we can't find the configuration addresses needed for lookup
@@ -176,15 +246,32 @@ async fn verify_network(
         network: &'a str,
         call_data: Vec<u8>,
         target: Address,
+        decoder: Decoder,
     }
 
-    let checks = vec![
+    // Helper to create a decoder
+    fn make_decoder<C: SolCall>(f: fn(C::Return) -> Address) -> Decoder
+    where
+        C::Return: Send + Sync + 'static,
+    {
+        Box::new(move |data| {
+            let ret = C::abi_decode_returns(data, true)?;
+            Ok(f(ret))
+        })
+    }
+
+    // Common decoder for simple address returns
+    // Note: Most functions generated by alloy for `returns (address)` return a tuple `(Address,)`
+    // or struct with field `_0`.
+
+    let checks: Vec<CheckConfig> = vec![
         CheckConfig {
             name: "Batch Inbox",
             file_search_name: "Batch Inbox",
             network: l2_network_name,
             call_data: SystemConfig::batchInboxCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::batchInboxCall>(|r| r._0),
         },
         CheckConfig {
             name: "DisputeGameFactory",
@@ -192,6 +279,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: SystemConfig::disputeGameFactoryCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::disputeGameFactoryCall>(|r| r._0),
         },
         CheckConfig {
             name: "Fault Dispute Game",
@@ -199,6 +287,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: DisputeGameFactory::gameImplsCall { gameType: 0 }.abi_encode(),
             target: dispute_game_factory,
+            decoder: make_decoder::<DisputeGameFactory::gameImplsCall>(|r| r._0),
         },
         CheckConfig {
             name: "Permissioned Dispute Game",
@@ -206,6 +295,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: DisputeGameFactory::gameImplsCall { gameType: 1 }.abi_encode(),
             target: dispute_game_factory,
+            decoder: make_decoder::<DisputeGameFactory::gameImplsCall>(|r| r._0),
         },
         CheckConfig {
             name: "Challenger",
@@ -213,6 +303,7 @@ async fn verify_network(
             network: l2_network_name,
             call_data: PermissionedDisputeGame::challengerCall {}.abi_encode(),
             target: permissioned_dispute_game,
+            decoder: make_decoder::<PermissionedDisputeGame::challengerCall>(|r| r._0),
         },
         CheckConfig {
             name: "Proposer",
@@ -220,6 +311,7 @@ async fn verify_network(
             network: l2_network_name,
             call_data: PermissionedDisputeGame::proposerCall {}.abi_encode(),
             target: permissioned_dispute_game,
+            decoder: make_decoder::<PermissionedDisputeGame::proposerCall>(|r| r._0),
         },
         CheckConfig {
             name: "Guardian",
@@ -227,6 +319,7 @@ async fn verify_network(
             network: l2_network_name,
             call_data: SystemConfig::guardianCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::guardianCall>(|r| r._0),
         },
         CheckConfig {
             name: "L1CrossDomainMessenger",
@@ -234,6 +327,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: SystemConfig::l1CrossDomainMessengerCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::l1CrossDomainMessengerCall>(|r| r._0),
         },
         CheckConfig {
             name: "L1ERC721Bridge",
@@ -241,6 +335,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: SystemConfig::l1ERC721BridgeCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::l1ERC721BridgeCall>(|r| r._0),
         },
         CheckConfig {
             name: "L1StandardBridge",
@@ -248,6 +343,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: SystemConfig::l1StandardBridgeCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::l1StandardBridgeCall>(|r| r._0),
         },
         CheckConfig {
             name: "OptimismMintableERC20Factory",
@@ -255,6 +351,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: SystemConfig::optimismMintableERC20FactoryCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::optimismMintableERC20FactoryCall>(|r| r._0),
         },
         CheckConfig {
             name: "OptimismPortal",
@@ -262,6 +359,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: SystemConfig::optimismPortalCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::optimismPortalCall>(|r| r._0),
         },
         CheckConfig {
             name: "ProxyAdmin",
@@ -269,6 +367,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: SystemConfig::proxyAdminCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::proxyAdminCall>(|r| r._0),
         },
         CheckConfig {
             name: "Proxy Admin Owner",
@@ -276,6 +375,7 @@ async fn verify_network(
             network: l2_network_name,
             call_data: SystemConfig::proxyAdminOwnerCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::proxyAdminOwnerCall>(|r| r._0),
         },
         CheckConfig {
             name: "SystemConfig Owner",
@@ -283,6 +383,7 @@ async fn verify_network(
             network: l2_network_name,
             call_data: SystemConfig::ownerCall {}.abi_encode(),
             target: sys_config,
+            decoder: make_decoder::<SystemConfig::ownerCall>(|r| r._0),
         },
         CheckConfig {
             name: "AnchorStateRegistry",
@@ -290,6 +391,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: FaultDisputeGame::anchorStateRegistryCall {}.abi_encode(),
             target: fault_dispute_game,
+            decoder: make_decoder::<FaultDisputeGame::anchorStateRegistryCall>(|r| r._0),
         },
         CheckConfig {
             name: "MIPS",
@@ -297,6 +399,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: FaultDisputeGame::vmCall {}.abi_encode(),
             target: fault_dispute_game,
+            decoder: make_decoder::<FaultDisputeGame::vmCall>(|r| r._0),
         },
         CheckConfig {
             name: "PreimageOracle",
@@ -304,6 +407,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: MIPS::oracleCall {}.abi_encode(),
             target: mips,
+            decoder: make_decoder::<MIPS::oracleCall>(|r| r._0),
         },
         CheckConfig {
             name: "DelayedWETHProxy (FDG)",
@@ -311,6 +415,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: FaultDisputeGame::wethCall {}.abi_encode(),
             target: fault_dispute_game,
+            decoder: make_decoder::<FaultDisputeGame::wethCall>(|r| r._0),
         },
         CheckConfig {
             name: "DelayedWETHProxy (PDG)",
@@ -318,6 +423,7 @@ async fn verify_network(
             network: l1_network_name,
             call_data: PermissionedDisputeGame::wethCall {}.abi_encode(),
             target: permissioned_dispute_game,
+            decoder: make_decoder::<PermissionedDisputeGame::wethCall>(|r| r._0),
         },
     ];
 
@@ -341,25 +447,22 @@ async fn verify_network(
         .await
         .context(format!("Multicall execution failed on {}", l1_network_name))?;
 
-    let mut all_checks_passed = true;
+    let mut check_results = Vec::new();
+
     for (i, check) in checks.iter().enumerate() {
-        let passed = process_result(
-            l1_network_name,
-            check.network,
+        let res = &result.returnData[i];
+
+        let result = process_result(
             check.name,
+            check.network,
             expected_addresses[i].clone(),
-            &result.returnData[i],
+            res,
+            &check.decoder,
         );
-        if !passed {
-            all_checks_passed = false;
-        }
+        check_results.push(result);
     }
 
-    if all_checks_passed {
-        println!("✅ All addresses match for {}", l1_network_name);
-    }
-
-    Ok(all_checks_passed)
+    Ok(check_results)
 }
 
 fn get_addr(networks: &[Network], network_name: &str, contract_name: &str) -> Result<Address> {
@@ -397,59 +500,62 @@ fn find_contract_address(
 }
 
 fn process_result(
-    l1_network: &str,
-    expected_addr_network: &str,
     contract_name: &str,
+    expected_addr_network: &str,
     expected_addr: Option<String>,
     res: &Multicall3::Result,
-) -> bool {
+    decoder: &Decoder,
+) -> CheckResult {
+    let mut result = CheckResult {
+        name: contract_name.to_string(),
+        network: expected_addr_network.to_string(),
+        expected: None,
+        actual: None,
+        success: false,
+        error: None,
+    };
+
     let expected_str = match expected_addr {
         Some(s) => s,
         None => {
-            println!(
-                "Could not find expected address for {} in {}",
-                contract_name, expected_addr_network
-            );
-            return false;
+            result.error = Some(format!(
+                "Could not find expected address in config for {}",
+                expected_addr_network
+            ));
+            return result;
         }
     };
 
     let expected = match Address::from_str(&expected_str) {
         Ok(a) => a,
         Err(e) => {
-            println!(
-                "Error parsing expected address for {} ({}): {}",
-                contract_name, expected_str, e
-            );
-            return false;
+            result.error = Some(format!(
+                "Error parsing expected address {}: {}",
+                expected_str, e
+            ));
+            return result;
         }
     };
+    result.expected = Some(expected);
 
     if !res.success {
-        println!("{} view call failed on {}", contract_name, l1_network);
-        return false;
+        result.error = Some("View call failed on-chain".to_string());
+        return result;
     }
 
-    // Decode address from return data generically
-    // Most of these calls return a single Address
-    let on_chain_addr = match <Address>::abi_decode(&res.returnData, true) {
+    let on_chain_addr = match decoder(&res.returnData) {
         Ok(addr) => addr,
         Err(e) => {
-            println!(
-                "Error decoding {} return data on {}: {}",
-                contract_name, l1_network, e
-            );
-            return false;
+            result.error = Some(format!("Error decoding return data: {}", e));
+            return result;
         }
     };
+    result.actual = Some(on_chain_addr);
 
     if on_chain_addr != expected {
-        println!(
-            "❌ MISMATCH for {}: \n\tFile {}: {}\n\tChain {}: {}",
-            l1_network, contract_name, expected, contract_name, on_chain_addr
-        );
-        return false;
+        return result; // success is already false
     }
 
-    true
+    result.success = true;
+    result
 }
