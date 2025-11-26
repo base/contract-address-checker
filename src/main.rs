@@ -134,111 +134,15 @@ async fn verify_network(
         return;
     }
 
-    let rpc_url = rpc_url.unwrap();
+    let sys_config = get_addr(networks, l1_network_name, "SystemConfig");
+    let dispute_game_factory = get_addr(networks, l1_network_name, "DisputeGameFactoryProxy");
+    let fault_dispute_game = get_addr(networks, l1_network_name, "FaultDisputeGame");
+    let permissioned_dispute_game = get_addr(networks, l1_network_name, "PermissionedDisputeGame");
+    let mips = get_addr(networks, l1_network_name, "MIPS");
 
-    let system_config_addr = find_contract_address(networks, l1_network_name, "SystemConfig");
-    let dispute_game_factory_addr =
-        find_contract_address(networks, l1_network_name, "DisputeGameFactoryProxy");
-    let fault_dispute_game_addr =
-        find_contract_address(networks, l1_network_name, "FaultDisputeGame");
-    let permissioned_dispute_game_addr =
-        find_contract_address(networks, l1_network_name, "PermissionedDisputeGame");
-    let mips_addr = find_contract_address(networks, l1_network_name, "MIPS");
-
-    if system_config_addr.is_none() {
-        println!(
-            "Could not find SystemConfig address for {}",
-            l1_network_name
-        );
-        return;
-    }
-
-    if dispute_game_factory_addr.is_none() {
-        println!(
-            "Could not find DisputeGameFactory address for {}",
-            l1_network_name
-        );
-        return;
-    }
-
-    if fault_dispute_game_addr.is_none() {
-        println!(
-            "Could not find FaultDisputeGame address for {}",
-            l1_network_name
-        );
-        return;
-    }
-
-    if permissioned_dispute_game_addr.is_none() {
-        println!(
-            "Could not find PermissionedDisputeGame address for {}",
-            l1_network_name
-        );
-        return;
-    }
-
-    if mips_addr.is_none() {
-        println!("Could not find MIPS address for {}", l1_network_name);
-        return;
-    }
-
-    let sys_config = match Address::from_str(&system_config_addr.unwrap()) {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!(
-                "Error parsing SystemConfig address for {}: {}",
-                l1_network_name, e
-            );
-            return;
-        }
-    };
-
-    let dispute_game_factory = match Address::from_str(&dispute_game_factory_addr.unwrap()) {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!(
-                "Error parsing DisputeGameFactory address for {}: {}",
-                l1_network_name, e
-            );
-            return;
-        }
-    };
-
-    let fault_dispute_game = match Address::from_str(&fault_dispute_game_addr.unwrap()) {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!(
-                "Error parsing FaultDisputeGame address for {}: {}",
-                l1_network_name, e
-            );
-            return;
-        }
-    };
-
-    let permissioned_dispute_game =
-        match Address::from_str(&permissioned_dispute_game_addr.unwrap()) {
-            Ok(addr) => addr,
-            Err(e) => {
-                println!(
-                    "Error parsing PermissionedDisputeGame address for {}: {}",
-                    l1_network_name, e
-                );
-                return;
-            }
-        };
-
-    let mips = match Address::from_str(&mips_addr.unwrap()) {
-        Ok(addr) => addr,
-        Err(e) => {
-            println!("Error parsing MIPS address for {}: {}", l1_network_name, e);
-            return;
-        }
-    };
-
-    let provider = ProviderBuilder::new().on_http(rpc_url.parse().unwrap());
     let multicall = Multicall3::new(
         Address::from_str(MULTICALL3_ADDRESS).unwrap(),
-        provider.clone(),
+        ProviderBuilder::new().on_http(rpc_url.unwrap().parse().unwrap()),
     );
 
     struct CheckConfig<'a> {
@@ -430,6 +334,27 @@ async fn verify_network(
 
     if all_checks_passed {
         println!("✅ All addresses match for {}", l1_network_name);
+    }
+}
+
+fn get_addr(networks: &[Network], network_name: &str, contract_name: &str) -> Address {
+    let addr = find_contract_address(networks, network_name, contract_name);
+
+    if addr.is_none() {
+        panic!(
+            "Could not find {} address for {}",
+            contract_name, network_name
+        );
+    }
+
+    match Address::from_str(&addr.unwrap()) {
+        Ok(addr) => addr,
+        Err(e) => {
+            panic!(
+                "Error parsing SystemConfig address for {}: {}",
+                network_name, e
+            );
+        }
     }
 }
 
